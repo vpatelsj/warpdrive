@@ -234,6 +234,14 @@ func (cm *CacheManager) ReadWithCacheHit(ctx context.Context, backendName, path 
 			allCacheHits = false
 		}
 
+		// Guard against short/partial blocks (e.g. last block of a file).
+		if blockOff >= len(block) {
+			if totalRead > 0 {
+				return totalRead, allCacheHits, nil
+			}
+			return 0, false, fmt.Errorf("cache: block %d is %d bytes but offset is %d for %s/%s", blockIdx, len(block), blockOff, backendName, path)
+		}
+
 		n := copy(p[totalRead:], block[blockOff:])
 		totalRead += n
 
@@ -325,17 +333,29 @@ func (cm *CacheManager) fetchBlock(ctx context.Context, be backend.Backend, back
 		return nil, fmt.Errorf("cache: fetch block %d of %s/%s: %w", blockIdx, backendName, path, err)
 	}
 
+	// Empty read at EOF — don't cache a zero-length block.
+	if n == 0 {
+		cm.blockPool.Put(bufPtr)
+		return nil, io.EOF
+	}
+
 	// Copy result out of pooled buffer.
 	result := make([]byte, n)
 	copy(result, buf[:n])
 	cm.blockPool.Put(bufPtr)
 
-	// Write to local NVMe.
+	// Write to local NVMe (atomic: write temp + rename to avoid partial reads).
 	localPath := blockLocalPath(cm.cacheDir, backendName, path, blockIdx)
 	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 		return result, nil // serve from memory even if cache write fails
 	}
-	if err := os.WriteFile(localPath, result, 0o644); err != nil {
+	tmpPath := localPath + ".tmp"
+	if err := os.WriteFile(tmpPath, result, 0o644); err != nil {
+		os.Remove(tmpPath)
+		return result, nil
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		os.Remove(tmpPath)
 		return result, nil
 	}
 
